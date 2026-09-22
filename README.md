@@ -4,8 +4,16 @@
 > **手机只负责显示和播放，模型推理与语音合成全部留在电脑** ——
 > 所以手机不耗电、不发烫，也不需要对不同机型做性能适配。
 
-本仓库只包含 **Sakura 插件**（供 Sakura 插件市场收录）。
-配套的安卓 App 在另一个仓库：[**FHSLX/sakura-APP**](https://github.com/FHSLX/sakura-APP)。
+本仓库只包含 **Sakura 插件**，是插件源码的唯一维护点，也是提交给
+[Sakura Registry](https://github.com/Rvosy/Sakura-Registry) 收录的仓库。
+
+配套的安卓 App，以及给普通用户下载的 App / 插件安装包，都在另一个仓库：
+[**FHSLX/sakura-APP**](https://github.com/FHSLX/sakura-APP)。
+本仓库不放 App，是因为插件市场按「仓库根目录 = 插件」打包 ——
+塞进安卓工程的话，装插件的人会白下载一整个 Android 项目。
+
+> **同步提醒**：改动插件后，需要把同样的改动同步到 `sakura-APP` 的根目录
+> （那份是发布用的副本，最终打进 Release 里的插件包）。
 
 ---
 
