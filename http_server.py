@@ -22,6 +22,7 @@ from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from posixpath import join as resource_join
 from typing import Any, Mapping
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -39,9 +40,6 @@ except ImportError:  # 宿主以顶层模块方式加载本文件时没有包上
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8770
 
-# sakura.host.mobile 的 begin/poll/cancel 需要显式传入调用方插件 ID
-# （框架只把 caller 放进 ContextVar，不会替你补第一个位置参数）。
-PLUGIN_SERVICE_CALLER = "sakura.remote"
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 30
@@ -49,7 +47,6 @@ CHAT_TIMEOUT_SECONDS = 120.0
 CHAT_POLL_SECONDS = 0.2
 TTS_TIMEOUT_SECONDS = 180.0
 TTS_POLL_SECONDS = 0.15
-TTS_CACHE_ENTRIES = 64
 MAX_CONCURRENT_REQUESTS = 12
 MAX_REQUESTS_PER_MINUTE = 240
 TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
@@ -108,9 +105,12 @@ def manifest_path(value: Path) -> Path:
 def run_remote_server(
     base_dir: Path,
     *,
-    mobile_service: Any,
+    conversation_service: Any,
     character_service: Any,
-    tts_service: Any = None,
+    timeline_service: Any,
+    artifact_service: Any,
+    visual_service: Any,
+    speech_service: Any = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     token: str = "",
@@ -133,9 +133,12 @@ def run_remote_server(
         probe.close()
     service = RemoteService(
         base_dir,
-        mobile_service=mobile_service,
+        conversation_service=conversation_service,
         character_service=character_service,
-        tts_service=tts_service,
+        timeline_service=timeline_service,
+        artifact_service=artifact_service,
+        speech_service=speech_service,
+        visual_service=visual_service,
         logger=logger,
         autoplay=autoplay,
         tts_enabled=tts_enabled,
@@ -243,10 +246,13 @@ class RemoteService:
         self,
         base_dir: Path,
         *,
-        mobile_service: Any,
+        conversation_service: Any,
         character_service: Any,
-        tts_service: Any,
+        timeline_service: Any,
+        artifact_service: Any,
+        speech_service: Any,
         logger: Any,
+        visual_service: Any,
         autoplay: bool = True,
         tts_enabled: bool = True,
         token: str = "",
@@ -254,9 +260,12 @@ class RemoteService:
         config_saver: Any = None,
     ) -> None:
         self.base_dir = Path(base_dir)
-        self.mobile = mobile_service
+        self.conversation = conversation_service
         self.characters = character_service
-        self.tts = tts_service
+        self.timeline = timeline_service
+        self.artifacts = artifact_service
+        self.speech = speech_service
+        self.visual = visual_service
         self.logger = logger
         self.autoplay = bool(autoplay)
         self.tts_enabled = bool(tts_enabled)
@@ -265,7 +274,6 @@ class RemoteService:
         self.port = int(port or 0)
         # 由插件注入：把设置写回 PluginConfig（网页不能直接碰宿主配置）
         self.config_saver = config_saver
-        self._cache_dir = self.base_dir / "cache" / "tts"
         self._upload_dir = self.base_dir / "cache" / "uploads"
         # 插件数据目录形如 <user_root>/data/plugins/<plugin_id>，
         # 因此上溯两级就是 Sakura 的 data 目录。
@@ -273,12 +281,9 @@ class RemoteService:
         # 再上溯一级是 Sakura 根目录，配置在 <root>/config/ 下。
         # 当前角色记在 config/characters.yaml 的 current_character_id。
         self._config_root = self._data_root.parent / "config"
-        self._artifact_root = self._data_root / "cache" / "plugin-artifacts"
         self._static_dir = Path(__file__).resolve().parent / STATIC_DIR_NAME
         self._state_lock = threading.RLock()
         self._portrait_cache: dict[str, tuple[str, bytes]] = {}
-        self._tts_cache: dict[str, Path] = {}
-        self._tts_lock = threading.RLock()
         self._character_cache: dict[str, Any] = {}
 
     # ---- 日志 -----------------------------------------------------
@@ -298,7 +303,7 @@ class RemoteService:
             record = {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "method": method,
-                "path": path,
+                "path": urlparse(path).path,
                 "client": _client_address_text(client),
                 "status": status,
             }
@@ -312,7 +317,7 @@ class RemoteService:
     # ---- 能力 -----------------------------------------------------
 
     def tts_available(self) -> bool:
-        return bool(self.tts_enabled and self.tts is not None)
+        return bool(self.tts_enabled and self.speech is not None)
 
     # ---- 设置读写 -------------------------------------------------
 
@@ -329,7 +334,7 @@ class RemoteService:
             if "autoplay" in override:
                 merged["autoplay"] = bool(override["autoplay"])
             if "tts_enabled" in override:
-                merged["tts_enabled"] = bool(override["tts_enabled"]) and self.tts is not None
+                merged["tts_enabled"] = bool(override["tts_enabled"]) and self.speech is not None
         return merged
 
     # 允许网页修改的字段；host/port/token 不在其中，改监听地址必须走桌面端设置，
@@ -343,7 +348,7 @@ class RemoteService:
             "settings": self.ui_settings(),
             "editable": list(self.EDITABLE_FIELDS),
             "server": {
-                "tts_service": self.tts is not None,
+                "tts_service": self.speech is not None,
                 "character_service": self.characters is not None,
                 "portrait_overrides": self.portrait_overrides(),
             },
@@ -375,10 +380,41 @@ class RemoteService:
     # ---- 角色与立绘 -------------------------------------------------
 
     def characters_list(self) -> list[dict[str, str]]:
-        result = self.mobile.characters()
-        if not isinstance(result, list):
-            raise RemoteUnavailableError("角色列表不可用。")
-        return [dict(item) for item in result if isinstance(item, Mapping)]
+        return [
+            {"id": item["id"], "name": item["displayName"],
+             "initial_message": item["initialMessage"],
+             "current": "true" if item["current"] else "false"}
+            for item in self.characters.list()
+        ]
+
+    def _history_entries(self, character_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        current = self.current_character_id()
+        if character_id and character_id != current:
+            raise ValueError("只能读取当前角色的聊天记录。")
+        entries = self.timeline.read_recent({"limit": max(1, min(int(limit), 200))})["entries"]
+        if any(entry["characterId"] != current for entry in entries):
+            raise ValueError("当前角色已切换，请刷新后重试。")
+        return entries
+
+    def history(self, character_id: str, limit: int = 50) -> list[dict[str, str]]:
+        result = []
+        for entry in self._history_entries(character_id, limit):
+            payload = entry["payload"]
+            if entry["kind"] == "human":
+                raw = str(payload.get("text") or "").strip()
+                content, translation, role = raw, "", "user"
+            elif entry["kind"] == "assistant":
+                segments = payload["segments"]
+                raw = "\n".join(item["text"] for item in segments if item.get("text"))
+                content = "\n".join(item.get("translation") or item["text"] for item in segments if item.get("text"))
+                translation = "\n".join(item["translation"] for item in segments if item.get("translation"))
+                role = "assistant"
+            else:
+                continue
+            if content:
+                result.append({"created_at": entry["createdAt"], "role": role, "content": content,
+                               "raw_content": raw, "translation": translation})
+        return result
 
     def current_character_id(self) -> str:
         for item in self.characters_list():
@@ -389,9 +425,7 @@ class RemoteService:
     def characters_payload(self) -> dict[str, Any]:
         """角色列表，供手机端展示与「切换角色」用。
 
-        注意：宿主只允许手机端和**当前角色**对话
-        （`sakura.host.mobile` 的 `_current_character` 在角色不匹配时直接抛
-        `MOBILE_CHARACTER_NOT_CURRENT`），所以这里只能列出角色、
+        宿主只允许手机端和当前角色对话，所以这里只能列出角色、
         不能真正切换当前角色 —— 切换必须由用户在电脑端操作。
         """
         items = []
@@ -625,26 +659,40 @@ class RemoteService:
         return manifest
 
     def _portrait_map(self, character_id: str) -> dict[str, str]:
+        current = self.visual.current()
+        target = current.get("target")
+        if (not target or target["characterId"] != character_id
+                or current.get("type") != "sakura.visual.portrait@1"):
+            return {}
         manifest = self._manifest(character_id)
         portrait = manifest.get("portrait")
+        root = "."
+        visuals = manifest.get("visuals")
+        if isinstance(visuals, Mapping):
+            resources = visuals.get("resources") or []
+            selected = target["resourceId"]
+            resource = next((item for item in resources if item.get("id") == selected), None)
+            if not resource or resource.get("type") != "sakura.visual.portrait@1":
+                raise RemoteUnavailableError("当前角色未选择手机端支持的立绘。")
+            root = str(resource["root"])
+            entry = resource_join(root, str(resource["entry"]))
+            path = Path(self.characters.resolve_resource(character_id, entry))
+            try:
+                portrait = json.loads(path.read_text(encoding="utf-8-sig"))
+                if root == "." and resource["entry"] == "character.json":
+                    portrait = portrait.get("portrait")
+            except (OSError, ValueError) as error:
+                raise RemoteUnavailableError("立绘配置读取失败。") from error
         result: dict[str, str] = {}
         if isinstance(portrait, Mapping):
             default = portrait.get("default")
             if isinstance(default, str) and default.strip():
-                result["__default__"] = default.strip()
+                result["__default__"] = resource_join(root, default.strip())
             expressions = portrait.get("expressions")
             if isinstance(expressions, Mapping):
                 for key, value in expressions.items():
                     if isinstance(key, str) and isinstance(value, str) and value.strip():
-                        result[key] = value.strip()
-        visuals = manifest.get("visuals")
-        if not result and isinstance(visuals, Mapping):
-            for resource in visuals.get("resources") or []:
-                if not isinstance(resource, Mapping):
-                    continue
-                entry = resource.get("entry")
-                if isinstance(entry, str) and entry.strip():
-                    result[str(resource.get("name") or "立绘")] = entry.strip()
+                        result[key] = resource_join(root, value.strip())
         if not result:
             raise RemoteUnavailableError("当前角色没有可用立绘。")
         return result
@@ -680,7 +728,7 @@ class RemoteService:
         manifest = self._manifest(character_id)
         theme: dict[str, Any] = {}
         try:
-            raw_theme = self.mobile.theme()
+            raw_theme = self.characters.presentation()["themeTokens"]
             if isinstance(raw_theme, Mapping):
                 theme = dict(raw_theme)
         except Exception as error:  # noqa: BLE001 - 主题只是外观增强
@@ -785,17 +833,16 @@ class RemoteService:
         if not clean_text and not image_data_url:
             raise ValueError("消息内容不能为空。")
         job_id = ""
+        artifact = self._image_artifact(image_data_url) if image_data_url else {}
         try:
-            # 注意参数形状：sakura.host.mobile 的 begin/poll/cancel 第一个位置参数
-            # 是调用方插件 ID（框架不会自动注入），history/characters 则不需要。
-            started = self.mobile.begin(PLUGIN_SERVICE_CALLER, character_id, clean_text, image_data_url)
+            started = self.conversation.begin(character_id, clean_text, artifact)
             if isinstance(started, Mapping):
                 job_id = str(started.get("jobId") or "")
             if not job_id:
                 raise RemoteUnavailableError("手机会话任务创建失败。")
             deadline = time.monotonic() + CHAT_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
-                state = self.mobile.poll(PLUGIN_SERVICE_CALLER, job_id)
+                state = self.conversation.poll(job_id)
                 if isinstance(state, Mapping) and state.get("status") == "completed":
                     result = state.get("result")
                     if not isinstance(result, Mapping):
@@ -805,6 +852,12 @@ class RemoteService:
             self._cancel(job_id)
             raise TimeoutError("等待回复超时，请重试。")
         except Exception as error:  # noqa: BLE001
+            if not job_id and artifact:
+                try:
+                    self.artifacts.release_received(artifact["artifactId"])
+                except Exception as cleanup_error:
+                    if getattr(cleanup_error, "code", "") != "ARTIFACT_NOT_FOUND":
+                        self.log("warning", "image_release_failed", {"error_type": type(cleanup_error).__name__})
             code = str(getattr(error, "code", "") or "")
             if code == "CHAT_EXECUTION_LIMIT_EXCEEDED":
                 raise RemoteBusyError("另一个对话正在进行，请稍后重试。") from error
@@ -812,9 +865,30 @@ class RemoteService:
 
     def _cancel(self, job_id: str) -> None:
         try:
-            self.mobile.cancel(PLUGIN_SERVICE_CALLER, job_id)
+            self.conversation.cancel(job_id)
         except Exception:  # noqa: BLE001
             pass
+
+    def _image_artifact(self, data_url: str) -> dict[str, Any]:
+        media_type, separator, encoded = data_url.partition(";base64,")
+        media_type = media_type.removeprefix("data:").lower()
+        suffix = _IMAGE_UPLOAD_TYPES.get(media_type)
+        if not separator or not data_url.startswith("data:image/") or suffix is None:
+            raise ValueError("不支持的图片格式。")
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise ValueError("图片编码无效。") from error
+        if not payload or len(payload) > MAX_IMAGE_BYTES:
+            raise ValueError("图片为空或过大。")
+        allocation = self.artifacts.allocate({"mediaType": media_type, "suffix": suffix})
+        artifact_id = allocation["artifactId"]
+        try:
+            Path(allocation["path"]).write_bytes(payload)
+            return dict(self.artifacts.commit(artifact_id))
+        except Exception:
+            self.artifacts.release(artifact_id)
+            raise
 
     def image_data_url(self, asset_url: str) -> str:
         """把 /api/upload 返回的资源路径转回 data URL 交给宿主。"""
@@ -840,104 +914,61 @@ class RemoteService:
 
     # ---- 语音 -----------------------------------------------------
 
-    def synthesize(self, character_id: str, text: str, tone: str = "") -> Path:
-        if not self.tts_available():
-            raise RemoteUnavailableError("语音合成未启用。")
+    def _speech_target(
+        self, character_id: str, text: str, history_entry_id: str, segment_index: object,
+    ) -> tuple[str, int]:
+        if history_entry_id:
+            if isinstance(segment_index, bool) or not isinstance(segment_index, int) or segment_index < 0:
+                raise ValueError("语音段落编号无效。")
+            return history_entry_id, segment_index
+        # 旧 App 只发送正文。只匹配当前角色已落盘的回复，不接受自由合成文本。
         clean_text = text.strip()
         if not clean_text:
-            raise ValueError("语音文本为空。")
-        cache_key = hashlib.sha256(
-            f"{character_id}\x00{tone}\x00{clean_text}".encode("utf-8")
-        ).hexdigest()
-        with self._tts_lock:
-            cached = self._tts_cache.get(cache_key)
-        if cached is not None and cached.is_file():
-            return cached
-
-        request_id = f"remote-{secrets.token_hex(12)}"
-        result = self.tts.begin(
-            {
-                "requestId": request_id,
-                "characterId": character_id,
-                "text": clean_text,
-                "options": {"tone": tone, "portrait": ""},
-            }
-        )
-        if not isinstance(result, Mapping):
-            raise RemoteUnavailableError("语音合成服务返回无效结果。")
-        if str(result.get("state")) == "failed":
-            raise RemoteUnavailableError(
-                f"语音合成失败：{result.get('errorCode') or 'unknown'}"
-            )
-        provider_id = str(result.get("providerId") or "")
-        audio_path = self._await_tts(request_id, provider_id)
-        if audio_path is None:
-            raise TimeoutError("语音合成超时。")
-        with self._tts_lock:
-            self._tts_cache[cache_key] = audio_path
-            if len(self._tts_cache) > TTS_CACHE_ENTRIES:
-                for stale_key in list(self._tts_cache)[: len(self._tts_cache) - TTS_CACHE_ENTRIES]:
-                    self._tts_cache.pop(stale_key, None)
-        return audio_path
-
-    def _await_tts(self, request_id: str, provider_id: str = "") -> Path | None:
-        deadline = time.monotonic() + TTS_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            state = self.tts.poll(request_id)
-            if not isinstance(state, Mapping):
-                raise RemoteUnavailableError("语音合成服务返回无效结果。")
-            status = str(state.get("state") or state.get("status") or "")
-            if status == "running":
-                time.sleep(TTS_POLL_SECONDS)
+            raise ValueError("没有指定要播放的回复。")
+        for entry in reversed(self._history_entries(character_id, 200)):
+            if entry["kind"] != "assistant":
                 continue
-            if status in {"failed", "error"}:
-                reason = str(state.get("errorCode") or state.get("error") or "unknown")
-                raise RemoteUnavailableError(f"语音合成失败：{reason}")
-            if status not in {"succeeded", "completed", "done", "finished"}:
-                time.sleep(TTS_POLL_SECONDS)
-                continue
-            artifact = state.get("artifact")
-            artifact_id = ""
-            if isinstance(artifact, Mapping):
-                artifact_id = str(artifact.get("artifactId") or "")
-            path = self._locate_artifact(artifact_id)
-            if path is None:
-                raise RemoteUnavailableError("语音文件已失效，请重新发送。")
-            return path
-        return None
+            for index, segment in enumerate(entry["payload"]["segments"]):
+                if clean_text in {str(segment.get("text") or "").strip(),
+                                  str(segment.get("translation") or "").strip()}:
+                    return entry["entryId"], index
+        raise ValueError("找不到这段回复，请重新打开聊天记录。")
 
-    def _locate_artifact(self, artifact_id: str) -> Path | None:
-        """把 TTS Hub 返回的 opaque artifact 描述符还原成本机 wav 路径。
-
-        Plugin API 只把 artifactId / mediaType / byteLength 交给消费方，
-        没有给出路径；这里按 PluginArtifactStore 的固定目录布局反查，
-        不依赖任何 Core 内部对象。
-        """
-
-        clean_id = str(artifact_id or "").strip()
-        if not clean_id.startswith("artifact_"):
-            return None
-        root = self._artifact_root
-        if not root.is_dir():
-            return None
+    def synthesize(
+        self, character_id: str, text: str = "", tone: str = "", *,
+        history_entry_id: str = "", segment_index: object = None,
+    ) -> bytes:
+        if not self.tts_available():
+            raise RemoteUnavailableError("语音合成未启用。")
+        current = self.current_character_id()
+        character_id = character_id or current
+        if character_id != current:
+            raise ValueError("只能播放当前角色的回复。")
+        entry_id, index = self._speech_target(character_id, text, history_entry_id, segment_index)
+        started = self.speech.begin(character_id, entry_id, index)
+        job_id = started["jobId"]
+        completed = False
         try:
-            for generation in root.iterdir():
-                if not generation.is_dir():
+            deadline = time.monotonic() + TTS_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                state = self.speech.poll(job_id)
+                if state["status"] == "running":
+                    time.sleep(TTS_POLL_SECONDS)
                     continue
-                for plugin_dir in generation.iterdir():
-                    candidate = plugin_dir / clean_id / "payload.wav"
-                    if candidate.is_file():
-                        return candidate
-        except OSError:
-            pass
-        # 兜底：兼容目录布局变化时按 artifactId 直接匹配。
-        try:
-            for candidate in root.glob(f"*/*/{clean_id}/payload.*"):
-                if candidate.is_file():
-                    return candidate
-        except OSError:
-            pass
-        return None
+                completed = True
+                artifact_id = state["result"]["artifact"]["artifactId"]
+                try:
+                    artifact = self.artifacts.resolve(artifact_id)
+                    return Path(artifact["path"]).read_bytes()
+                finally:
+                    self.artifacts.release_received(artifact_id)
+            raise TimeoutError("语音合成超时。")
+        finally:
+            if not completed:
+                try:
+                    self.speech.cancel(job_id)
+                except Exception:
+                    pass
 
     # ---- 上传 -----------------------------------------------------
 
@@ -1061,7 +1092,7 @@ def _build_handler(service: RemoteService, token: str) -> type[BaseHTTPRequestHa
                     character_id = _first_query_value(params, "character_id")
                     limit = _safe_int(_first_query_value(params, "limit"), 50)
                     self._send_json(
-                        {"history": service.mobile.history(character_id, limit)}
+                        {"history": service.history(character_id, limit)}
                     )
                     return
                 status = HTTPStatus.NOT_FOUND.value
@@ -1207,12 +1238,12 @@ def _build_handler(service: RemoteService, token: str) -> type[BaseHTTPRequestHa
             tone = str(payload.get("tone") or "")
             if not character_id:
                 character_id = service.current_character_id()
-            path = service.synthesize(character_id, text, tone)
-            try:
-                audio = path.read_bytes()
-            except OSError as error:
-                raise RemoteUnavailableError("语音文件读取失败。") from error
-            self._send_bytes(audio, "audio/wav", cache_seconds=3600, etag_source=audio)
+            audio = service.synthesize(
+                character_id, text, tone,
+                history_entry_id=str(payload.get("history_entry_id") or ""),
+                segment_index=payload.get("segment_index"),
+            )
+            self._send_bytes(audio, "audio/wav")
 
         # ---- 请求解析 ----
         def _read_json_body(self) -> dict[str, Any]:

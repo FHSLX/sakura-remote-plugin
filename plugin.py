@@ -1,9 +1,9 @@
 """sakura_remote 插件：手机远程端。
 
 把手机变成 Sakura 桌宠的远程显示器：
-- 聊天与 AI 计算全部在电脑主进程完成（走 sakura.host.mobile）;
+- 聊天与 AI 计算全部在电脑主进程完成（走 sakura.host.conversation）;
 - 立绘图片由电脑读取并通过 HTTP 直接推给手机（走 sakura.host.character 解析资源）;
-- 语音由电脑端 TTS 合成后以 WAV 形式回传（走 sakura.tts），手机只负责播放。
+- 语音按已保存的回复段落向 sakura.host.speech 请求，手机只负责播放。
 
 本模块只依赖 Python 标准库。
 """
@@ -32,7 +32,7 @@ except ImportError:
 
 
 PLUGIN_ID = "sakura.remote"
-MOBILE_SERVICE = "sakura.host.mobile"
+CONVERSATION_SERVICE = "sakura.host.conversation"
 CHARACTER_SERVICE = "sakura.host.character"
 SETTINGS_SECTION_ID = "sakura_remote"
 
@@ -44,9 +44,12 @@ class SakuraRemotePlugin:
         self._context: object | None = None
         self._logger: Any = None
         self._config: object | None = None
-        self._mobile: object | None = None
+        self._conversation: object | None = None
+        self._artifacts: object | None = None
+        self._timeline: object | None = None
         self._characters: object | None = None
-        self._tts: object | None = None
+        self._visual: object | None = None
+        self._speech: object | None = None
         self._data_dir: Path | None = None
         self._server: Any | None = None
         self._thread: Any | None = None
@@ -62,13 +65,12 @@ class SakuraRemotePlugin:
         # 会让远程重启脚本静默启动失败（实测 helper 进程起来了但什么都没做）。
         self._data_dir = Path(getattr(context, "data_path")("."))
         self._config = getattr(context, "config")
-        self._mobile = getattr(context, "get")(MOBILE_SERVICE)
+        self._conversation = getattr(context, "get")(CONVERSATION_SERVICE)
+        self._artifacts = getattr(context, "get")("sakura.host.artifacts")
+        self._timeline = getattr(context, "get")("sakura.host.timeline")
         self._characters = getattr(context, "get")(CHARACTER_SERVICE)
-        # TTS 走普通服务代理：没有该服务时只有语音功能不可用，文字和立绘照常工作。
-        try:
-            self._tts = getattr(context, "get")("sakura.tts")
-        except Exception:  # noqa: BLE001 - TTS 是可选能力
-            self._tts = None
+        self._visual = getattr(context, "get")("sakura.host.visual")
+        self._speech = getattr(context, "get")("sakura.host.speech")
         getattr(context, "effect")(self.stop)
         getattr(context, "on")("sakura.host.app.started", lambda _event: self.start())
         getattr(self._config, "on_change")(self._apply_config)
@@ -84,25 +86,19 @@ class SakuraRemotePlugin:
         self._log_info(
             "手机远程端插件已就绪",
             {
-                "mobile_service": self._mobile is not None,
+                "conversation_service": self._conversation is not None,
                 "character_service": self._characters is not None,
-                "tts_service": self._tts is not None,
+                "speech_service": self._speech is not None,
                 "data_dir": str(self._data_dir) if self._data_dir else "",
-                "config": self._raw_config(),
+                "enabled": self.config()["enabled"],
+                "host": self.config()["host"],
+                "port": self.config()["port"],
             },
         )
 
     def config(self) -> dict[str, Any]:
         config = self._require_config()
         return _normalized_config(getattr(config, "get")())
-
-    def _raw_config(self) -> dict[str, Any]:
-        """原始配置，用于诊断（不触发规范化）。"""
-
-        try:
-            return dict(getattr(self._require_config(), "get")())
-        except Exception as error:  # noqa: BLE001
-            return {"_config_error": f"{type(error).__name__}: {error}"}
 
     def settings_values(self) -> dict[str, Any]:
         status = self.status()
@@ -173,8 +169,8 @@ class SakuraRemotePlugin:
         if not config["enabled"]:
             self._last_error = ""
             return
-        if self._mobile is None or self._characters is None:
-            self._last_error = "宿主移动端服务尚未就绪。"
+        if self._conversation is None or self._characters is None or self._artifacts is None:
+            self._last_error = "宿主对话服务尚未就绪。"
             self._log_warning(self._last_error, None)
             return
         if self._data_dir is None:
@@ -184,16 +180,19 @@ class SakuraRemotePlugin:
         try:
             server = run_remote_server(
                 self._data_dir,
-                mobile_service=self._mobile,
+                conversation_service=self._conversation,
                 character_service=self._characters,
-                tts_service=self._tts,
+                visual_service=self._visual,
+                timeline_service=self._timeline,
+                artifact_service=self._artifacts,
+                speech_service=self._speech,
                 host=str(config["host"]),
                 port=int(config["port"]),
                 token=str(config["token"]),
                 autoplay=bool(config["autoplay"]),
                 tts_enabled=bool(config["tts_enabled"]),
                 logger=self._logger,
-                    config_saver=self.save_remote_settings,
+                config_saver=self.save_remote_settings,
             )
         except OSError as error:
             self._log_warning(

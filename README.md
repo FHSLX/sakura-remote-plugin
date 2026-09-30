@@ -116,10 +116,8 @@ AI 计算和语音合成都留在电脑 · 手机只负责显示和播放
 
 Sakura 官方自带一个可选的手机网页插件
 [`sakura_mobile`（手机聊天）](https://github.com/Rvosy/sakura/tree/main/plugins/optional/sakura_mobile)，
-作者 **pa1n9**。**本项目正是参考它做出来的**：它验证了 `sakura.host.mobile` 这套服务接口
-（`begin` / `poll` / `cancel`，图片走 `sakura.host.artifacts` 传 descriptor）
-足以让第三方插件把手机接进来，完全不用碰 Core 内部 ——
-本项目的聊天提交、历史读取、图片上传就沿用了它趟过的做法。
+作者 **pa1n9**。当前版本参考它的 `sakura.host.conversation`、角色、Timeline 和图片资源接入方式：
+聊天通过 `begin` / `poll` / `cancel` 完成，图片通过 `sakura.host.artifacts` 提交资源描述符。
 
 在它的基础上，本项目把「手机端」从**聊天页**推进到了**桌宠**：
 加了全屏立绘与语气表情、语音自动播放、桌面悬浮窗、圆形小球，以及一套安卓 App 外壳。
@@ -176,8 +174,10 @@ Sakura 官方自带一个可选的手机网页插件
 
 | 项目 | 要求 |
 | :--- | :--- |
-| Sakura | 支持 Plugin API **v4**（[官方下载](https://github.com/Rvosy/sakura/releases)） |
+| Sakura | Plugin API **v4**，并提供 `sakura.host.conversation`、`sakura.host.speech`、`sakura.host.timeline` 和 `sakura.host.visual`（[官方下载](https://github.com/Rvosy/sakura/releases)） |
 | 系统 | Windows 10 / 11（**远程重启**功能依赖 Windows 计划任务，仅 Windows 可用；其余功能理论上跨平台，但未验证） |
+
+`1.3.0-rc.1` 需要 Sakura **1.3.0 或更高版本**的宿主接口，先升级主程序再安装此版本。宿主接口变更见 [Sakura #239](https://github.com/Rvosy/Sakura/pull/239)；只有 Plugin API v4、没有上述服务的旧版 Sakura 无法启用。接口和兼容说明见 [插件技术说明](PLUGIN.md#宿主接口与兼容)。
 
 ### 手机端：适用的安卓版本
 
@@ -449,11 +449,11 @@ git push origin v1.0.0
    ↓
 插件 POST /api/chat
    ↓
-sakura.host.mobile  →  电脑端对话模型（含长期记忆）
+sakura.host.conversation  →  电脑端对话模型（含长期记忆）
    ↓ 返回带语气的分段回复
 插件按语气映射立绘 → 手机显示
    ↓
-每段日文原文 + 语气 → 电脑端 TTS → WAV 回传 → 手机播放
+历史回复 ID + 段落序号 → sakura.host.speech → WAV 回传 → 手机播放
 ```
 
 ### 开发时最容易踩的两个坑

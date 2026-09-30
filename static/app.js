@@ -1490,7 +1490,7 @@ async function sendWithScreenshot(dataUrl) {
         deferText: true,
       });
       segment.bubble = node.bubble;
-      setPortrait(segment.tone);
+      setPortrait(segment.tone, segment.portrait);
       enqueueSegment(segment);
       if (!state.voiceEnabled) await sleep(180);
     }
@@ -2331,7 +2331,8 @@ function scorePortrait(tone, key) {
   return score;
 }
 
-function resolvePortraitKey(tone) {
+function resolvePortraitKey(tone, portrait = '') {
+  if (portrait && state.portraitByKey.has(portrait)) return portrait;
   const cleanTone = String(tone || '').trim();
   if (cleanTone && state.portraitOverrides.has(cleanTone)) {
     const forced = state.portraitOverrides.get(cleanTone);
@@ -2352,8 +2353,8 @@ function resolvePortraitKey(tone) {
   return state.portraitByKey.keys().next().value || '';
 }
 
-function setPortrait(tone) {
-  const key = resolvePortraitKey(tone);
+function setPortrait(tone, portrait = '') {
+  const key = resolvePortraitKey(tone, portrait);
   if (!key || key === state.currentPortraitKey) return;
   const url = state.portraitByKey.get(key);
   if (!url) return;
@@ -2371,17 +2372,17 @@ function setPortrait(tone) {
 function applyTheme(theme) {
   if (!theme || typeof theme !== 'object') return;
   const map = {
-    primary_color: '--primary',
-    primary_hover_color: '--primary-hover',
-    accent_color: '--accent',
-    text_color: '--text',
-    secondary_text_color: '--secondary-text',
-    muted_text_color: '--muted-text',
-    page_background_color: '--page-bg',
-    panel_background_color: '--panel-bg',
-    input_background_color: '--input-bg',
-    bubble_background_color: '--bubble-bg',
-    border_color: '--border',
+    primary: '--primary',
+    primaryHover: '--primary-hover',
+    accent: '--accent',
+    text: '--text',
+    secondaryText: '--secondary-text',
+    mutedText: '--muted-text',
+    pageBackground: '--page-bg',
+    panelBackground: '--panel-bg',
+    inputBackground: '--input-bg',
+    bubbleBackground: '--bubble-bg',
+    border: '--border',
   };
   Object.keys(map).forEach((source) => {
     const value = theme[source];
@@ -2389,7 +2390,7 @@ function applyTheme(theme) {
       document.documentElement.style.setProperty(map[source], value);
     }
   });
-  document.documentElement.style.setProperty('--stage-bg', theme.page_background_color || '#fff6fa');
+  document.documentElement.style.setProperty('--stage-bg', theme.pageBackground || '#fff6fa');
 }
 
 /* ---------- 气泡 ---------- */
@@ -3016,7 +3017,7 @@ function renderQuickActions() {
 }
 
 function enqueueSegment(segment) {
-  if (!state.voiceEnabled || !segment.rawText) {
+  if (!state.voiceEnabled || !segment.rawText || segment.suppressTts) {
     // 没有语音可依据，仍按估算节奏逐字显示 —— 不能留着空气泡
     if (segment.bubble) revealBubbleText(segment.bubble, 0);
     return;
@@ -3054,6 +3055,8 @@ async function playSegment(segment) {
       body: JSON.stringify({
         token: TOKEN,
         character_id: segment.characterId,
+        history_entry_id: segment.historyEntryId,
+        segment_index: segment.segmentIndex,
         text: segment.rawText,
         tone: segment.tone,
       }),
@@ -3076,7 +3079,7 @@ async function playSegment(segment) {
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
     segment.bubble.classList.add('speaking');
-    setPortrait(segment.tone);
+    setPortrait(segment.tone, segment.portrait);
     player.onended = null;
     player.src = url;
     /*
@@ -3205,17 +3208,20 @@ async function loadHistory(silent) {
 function segmentsFromReply(data) {
   const raw = Array.isArray(data.segments) ? data.segments : [];
   const result = [];
-  raw.forEach((item) => {
+  raw.forEach((item, index) => {
     if (!item) return;
     const spoken = String(item.raw_content || '').trim();
     const shown = String(item.content || item.raw_content || '').trim();
     if (!shown && !spoken) return;
     result.push({
       characterId: data.character_id || state.characterId,
+      historyEntryId: data.historyEntryId || '',
+      segmentIndex: Number.isInteger(item.segmentIndex) ? item.segmentIndex : index,
+      suppressTts: item.suppressTts === true,
       text: shown,
       rawText: spoken,
       tone: String(item.tone || ''),
-      portrait: String(item.portrait || ''),
+      portrait: String((item.control && item.control.payload && item.control.payload.key) || item.portrait || ''),
     });
   });
   if (!result.length) {
@@ -3287,7 +3293,7 @@ async function send(text, file) {
         deferText: true,
       });
       segment.bubble = node.bubble;
-      setPortrait(segment.tone);
+      setPortrait(segment.tone, segment.portrait);
       enqueueSegment(segment);
       if (!state.voiceEnabled) await sleep(180);
     }

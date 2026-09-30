@@ -16,9 +16,11 @@
 
 本项目参考了 Sakura 官方自带的可选插件
 [`sakura_mobile`（手机聊天）](https://github.com/Rvosy/sakura/tree/main/plugins/optional/sakura_mobile)
-（作者 **pa1n9**）做成，沿用了它验证过的 `sakura.host.mobile` 聊天链路与
+（作者 **pa1n9**）做成，最初沿用了它的 `sakura.host.mobile` 聊天链路与
 `sakura.host.artifacts` 图片传递方式，并在此基础上增加了立绘与语气表情、
 语音播放、桌面悬浮窗与圆形小球。
+
+当前版本迁移到宿主公开的 `sakura.host.conversation` 与 `sakura.host.speech` 接口。
 
 ## 角色资源
 
