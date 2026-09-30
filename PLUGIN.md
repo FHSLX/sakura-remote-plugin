@@ -8,10 +8,27 @@
    │  立绘 PNG、WAV 语音、文字分段、图片上传
    ▼
 sakura.remote 插件（跑在 Sakura 主进程的插件 Worker 里）
-   ├── sakura.host.mobile     → 聊天、历史、主题
-   ├── sakura.host.character  → 解析当前角色包里的立绘路径
-   └── sakura.tts             → 合成语音（返回 audio/wav artifact）
+   ├── sakura.host.conversation → 聊天与图片消息
+   ├── sakura.host.character / timeline → 角色、主题和历史
+   ├── sakura.host.visual / character → 当前立绘资源与图片
+   └── sakura.host.speech / artifacts → 已保存回复的语音与资源回收
 ```
+
+## 宿主接口与兼容
+
+`1.3.0-rc.1` 需要 Sakura 1.3.0 或更高版本（[宿主 PR #239](https://github.com/Rvosy/Sakura/pull/239)）提供 `sakura.host.conversation`、`sakura.host.character`、
+`sakura.host.timeline`、`sakura.host.visual`、`sakura.host.speech`、`sakura.host.artifacts` 和设置服务。
+缺少这些服务的旧版 Sakura 无法启用此版本。
+
+- 聊天使用 `conversation.begin/poll/cancel`。历史读取当前角色的 Timeline，并保留手机 HTTP 的 `content/raw_content/translation` 字段。
+- 新网页调用 `/api/tts` 时传 `character_id/history_entry_id/segment_index`。段落序号使用宿主返回的 `segmentIndex`，不因隐藏空白段落重新编号；`suppressTts` 为真时不请求播放。
+- 旧 App 仍可只传 `text`。插件只在当前角色最近 200 条 Timeline 记录中精确匹配回复原文或译文，使用最近的匹配段落；找不到则拒绝。客户端传来的 `tone` 不覆盖历史语气。
+- `speech.begin(character_id, history_entry_id, segment_index)` 返回任务 ID，`poll` 完成后返回授权音频描述符。插件用 `artifacts.resolve` 读取，并在 `finally` 中 `release_received`，不删除宿主保留的录音。
+- 立绘跟随 `visual.current()` 返回的当前资源。支持旧 `portrait` 和 `sakura.visual.portrait@1` 的 `root + entry` 资源 JSON，读取其中 `default/expressions`；Spine 等其他渲染类型不在手机图片端支持范围内。没有已绑定的立绘时返回空图片列表，仍可聊天。
+- 回复优先使用 `control.payload.key` 指定的表情；旧 `portrait` 字段和语气映射继续可用。
+
+插件 ID、端口、token 和设置文件保持不变，Android 工程无需为上述 HTTP 兼容字段另行更新。
+语音接口不会绕过宿主的当前角色、已保存段落、取消和资源归属检查。
 
 ## 功能
 
@@ -22,9 +39,8 @@ sakura.remote 插件（跑在 Sakura 主进程的插件 Worker 里）
   这是 Android 上唯一能让应用内容显示在桌面之上的方式。
 - **后台保活**：前台服务 + 常驻通知 + 电池优化白名单，返回桌面或切到别的应用后依然存活。
 - **分段对话**：模型回复的每个句段依次出现在气泡里，中文为主体、日文原文缩小作参考。
-- **语音播放**：每段文字用 `raw_content`（日文原文）+ `tone` 送电脑端 TTS 合成，
-  合成的 WAV 回传手机自动播放；下一段在上一段播放时就已经合成好，形成连续说话感。
-- **图片消息**：手机拍照/相册图片先上传到插件缓存目录，再由插件转成 data URL 交给宿主。
+- **语音播放**：按历史回复 ID 和段落序号获取语音，宿主复用已有录音或按保存的原文与语气合成；手机接收 WAV 播放。
+- **图片消息**：手机拍照/相册图片先上传到插件缓存目录，再提交为宿主图片资源；跨进程只传资源描述符。
 - **同一份记忆**：聊天、历史、长期记忆都走桌面端同一条链路，手机和电脑看到的是同一段对话。
 
 ## 安装
@@ -95,7 +111,7 @@ http://电脑IP:8770/?token=你的token
 }
 ```
 
-key 是语气名，value 必须是角色 `character.json` 里 `portrait.expressions` 的 key。
+key 是语气名，value 必须是当前立绘资源 `expressions` 的 key；旧角色读取 `character.json` 里的 `portrait.expressions`。
 这份映射优先于自动匹配，但只在该 key 真的存在时生效。
 
 ## HTTP 接口
@@ -109,8 +125,8 @@ key 是语气名，value 必须是角色 `character.json` 里 `portrait.expressi
 | GET | `/api/history?character_id=&limit=` | 历史消息 |
 | GET | `/asset/portrait?character=&key=` | 立绘 PNG（带 ETag，浏览器会缓存） |
 | GET | `/cache/uploads/<file>` | 已上传的图片 |
-| POST | `/api/chat` | `{character_id, text, image_url?}` → 分段回复 |
-| POST | `/api/tts` | `{character_id, text, tone?}` → `audio/wav` |
+| POST | `/api/chat` | `{character_id, text, image_asset?}` → 含 `historyEntryId` 和 `segmentIndex` 的分段回复；仍接受 `image_url` data URL |
+| POST | `/api/tts` | `{character_id, history_entry_id, segment_index}` → `audio/wav`；仍接受旧 `{character_id, text, tone?}` 的历史匹配请求 |
 | POST | `/api/upload` | `{media_type, data(base64)}` → `{url}` |
 
 所有接口都要 token：查询参数、JSON 体里的 `token`，或 `X-Sakura-Remote-Token` 请求头。
@@ -122,26 +138,33 @@ key 是语气名，value 必须是角色 `character.json` 里 `portrait.expressi
 - 插件日志：Sakura 的插件日志面板（事件名如 `server_created`）
 - 访问日志：`<Sakura>\data\plugins\sakura.remote\logs\remote-access.log`
 
+访问日志只记录 URL 路径，不记录含 token 的查询参数。
+
+## 开发验证
+
+在插件仓库根目录运行适配测试和网页协议测试：
+
+```powershell
+& '<Sakura源码>\runtime\python.exe' -m pytest -q tests/test_host_adapter.py
+node --test tests/reply_protocol.test.cjs
+```
+
+完整宿主集成需要包含上述接口的 Sakura 源码和 bundled Runtime。该测试使用临时用户目录、真实插件子进程及 HTTP，语音 provider 生成测试 WAV，不调用外部模型：
+
+```powershell
+$env:SAKURA_SOURCE = '<Sakura源码>'
+& '<Sakura源码>\runtime\python.exe' -m pytest -q tests/host_integration.py
+```
+
 ## 与宿主交互时踩过的坑
 
 这几条都是在本机真机联调时实际踩到并修掉的，改代码时请留意。
 
-### 1. `sakura.host.mobile` 的参数形状不统一
+### 1. 通用对话接口
 
-框架不会自动注入调用方插件 ID（`runtime_v4._route_service_call` 里是 `callback(*args)`），
-但 `sakura.host.mobile` 的部分方法把插件 ID 作为**第一个位置参数**：
-
-| 方法 | 正确调用 |
-| --- | --- |
-| `characters()` | 无参数 |
-| `history(character_id, limit)` | 无 plugin_id |
-| `begin(plugin_id, character_id, text, artifact)` | **要 plugin_id** |
-| `poll(plugin_id, job_id)` | **要 plugin_id** |
-| `cancel(plugin_id, job_id)` | **要 plugin_id** |
-
-漏掉 plugin_id 会让参数整体左移一位：`character_id` 收到消息正文，宿主报
-`MOBILE_CHARACTER_NOT_CURRENT`，而且失败发生在调模型之前（0 秒返回）。
-`tests/plugin_runtime_smoke.py` 的桩件刻意复刻了这个签名，签名写错会被测试抓住。
+`conversation.begin(character_id, text, artifact)`、`poll(job_id)` 和 `cancel(job_id)` 不接收插件 ID；身份由宿主绑定。
+无图传 `{}`，有图先通过 `artifacts.allocate/commit` 提交，再传 `artifactId/mediaType/byteLength`。
+不要把 data URL 直接传入 Plugin IPC。完整的语音、立绘兼容说明见[宿主接口与兼容](#宿主接口与兼容)。
 
 ### 2. 插件配置必须是「无 BOM」的 UTF-8
 
@@ -239,25 +262,19 @@ msedge --headless=new --screenshot=out.png --window-size=1280,900 `
 | --- | --- |
 | 手机打不开网页 | 确认 Sakura 在运行、插件已启用、设置里开关已打开；看访问日志有没有请求进来 |
 | 只能显示文字没有声音 | 先点一下屏幕（浏览器要求用户手势才允许播放）；确认「合成语音」开着、Sakura 里 TTS 引擎正常 |
-| 语音报「语音文件已失效」 | TTS artifact 被回收，重新发一条消息即可 |
+| 语音请求失败 | 检查当前角色是否启用语音；切换角色或重载插件后刷新手机页面 |
 | 立绘一直是同一张 | 在 `portrait_map.json` 里手工指定语气对应的立绘 |
 | 端口被占用 | 换一个端口，例如 8771，保存后插件会重启服务 |
 | 外网访问 | 不要直接映射端口；用 `tailscale serve --bg --http=8770 127.0.0.1:8770` |
-| 聊天报 `MOBILE_CHARACTER_NOT_CURRENT` | 检查 `begin/poll/cancel` 是否传了 plugin_id（见上文第 1 条） |
+| 聊天报 `CHAT_CHARACTER_NOT_CURRENT` | 手机选择的角色已不是桌面当前角色，刷新后重试 |
 | 插件启动报 `PLUGIN_CONFIG_INVALID` | 配置文件带了 UTF-8 BOM（见上文第 2 条） |
 | 启动时报 `PLUGIN_DEPENDENCY_INSTALL_FAILED` | 插件依赖目录里有**重复包版本**（安装被打断的残骸），uv 覆盖安装会返回非 0。用 uv 对同一个 `--target` 重跑一次 `pip install --requirements` 即可修复 |
 
 ## 排查「角色不是当前角色」
 
-聊天接口报 `MOBILE_CHARACTER_NOT_CURRENT` 时，按这个顺序查：
-
-1. **参数形状**：`sakura.host.mobile` 的 `begin/poll/cancel` 需要把插件 id
-   作为**第一个位置参数**（见上文第 1 条）。漏了它，后面的参数会整体错位，
-   `character_id` 收到的其实是消息文本。
-2. **角色是否一致**：`blame` 落在会话角色上时，用配置页的「角色」卡片
-   确认电脑端当前是哪个角色 —— 手机端只能和当前角色对话。
-3. **日志**：`<Sakura>/data/plugins/sakura.remote/logs/remote-access.log`
-   记录了每个请求的路径、状态码和来源，先看有没有 400/404。
+聊天接口报 `CHAT_CHARACTER_NOT_CURRENT` 时，确认电脑端当前角色并刷新手机页面。
+通用对话接口的参数不含插件 ID，签名见上文。插件访问日志位于
+`data/plugins/sakura.remote/logs/remote-access.log`，记录请求状态。
 
 > 早期版本有个 `GET /api/debug` 诊断端点，会输出插件上下文类型和角色详情。
 > 它属于排查用的临时接口、暴露面偏大，**已在发布版中移除**。
@@ -267,10 +284,7 @@ msedge --headless=new --screenshot=out.png --window-size=1280,900 `
 - **电脑必须开着、Sakura 必须运行**，这是远程串流，不是离线可用。
 - 语音延迟等于 TTS 合成时间（本机实测每段 3–6 秒），文字和立绘是立刻出现的。
 - 语音走 32 kHz 单声道 WAV，一段 10 秒约 640 KB，局域网和 4G 都没问题。
-- TTS 结果通过 Plugin API 的 opaque artifact 描述符返回，插件是按
-  `data/cache/plugin-artifacts/<generation>/<plugin>/<artifactId>/payload.wav`
-  这一固定布局反查文件的。Sakura 若改动该布局，需要同步调整
-  `http_server.py` 的 `_locate_artifact`。
+- 语音只能来自当前角色已保存的回复，不能请求朗读任意文本。音频通过宿主授权的资源读取，读取完成后释放；插件不扫描宿主缓存目录。
 
 ## 手机联调
 
@@ -398,7 +412,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\build_release.ps1
 ```
 电脑端 <Sakura>/characters/*/character.json
   → CharacterRegistry(...).profiles      （宿主扫目录）
-  → sakura.host.mobile 的 characters()    （宿主服务）
+  → sakura.host.character 的 list()       （宿主服务）
   → 插件 /api/characters                  （原样透传）
 ```
 
